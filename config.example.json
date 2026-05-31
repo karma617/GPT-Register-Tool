@@ -213,7 +213,7 @@
             {"number": "CARD_NUMBER", "exp_month": "MM", "exp_year": "YYYY", "cvv": "CVV"}
         ],
         "addresses": [
-            {"line1": "ADDRESS_LINE_1", "city": "CITY", "state": "ST", "postal_code": "ZIP"}
+            {"line1": "ADDRESS_LINE_1", "city": "CITY", "state": "ST", "postal_code": "ZIP", "country": "US"}
         ],
         "card_index_file": "runtime/paypal_card_index.txt",
         "headless": false,
@@ -226,6 +226,11 @@
         "locale_lang": "en",
         "otp_timeout": 180,
         "impersonate": "chrome136",
+        "datadome_browser_seed": false,
+        "datadome_browser_timeout": 300,
+        "datadome_browser_headless": false,
+        "datadome_seed_engine": "chromium",
+        "proxies": [],
         "reuse_saved_url": false,
         "reuse_saved_ready_url": true,
         "saved_url_max_age_seconds": 1800,

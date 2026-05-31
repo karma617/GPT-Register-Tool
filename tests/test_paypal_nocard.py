@@ -1,5 +1,7 @@
 import os
+import json
 import sqlite3
+import subprocess
 import tempfile
 import time
 import urllib.parse
@@ -12,6 +14,20 @@ from sms_tool import paypal_links, paypal_nocard
 
 
 class PayPalNoCardUnitTests(unittest.TestCase):
+    def test_load_config_accepts_utf8_bom(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            config_path = Path(tmp) / "config.json"
+            config_path.write_text(
+                '\ufeff{"paypal_nocard":{"enabled":true},"paypal_auto":{"cards":[{"number":"4111111111111111"}]}}',
+                encoding="utf-8",
+            )
+
+            with patch.object(paypal_nocard, "DEFAULT_CONFIG_PATH", str(config_path)):
+                cfg = paypal_nocard._load_config()
+
+        self.assertTrue(cfg["paypal_nocard"]["enabled"])
+        self.assertEqual(len(cfg["paypal_auto"]["cards"]), 1)
+
     def test_extract_ba_and_ec_tokens(self):
         self.assertEqual(
             paypal_nocard.extract_ba_token("https://www.paypal.com/agreements/approve?ba_token=BA-123_ABC-def"),
@@ -79,12 +95,41 @@ class PayPalNoCardUnitTests(unittest.TestCase):
         self.assertEqual(paypal_nocard._phone_split("+14482162932"), ("1", "4482162932"))
         self.assertEqual(paypal_nocard._phone_split("+447911123456"), ("44", "7911123456"))
 
+    def test_datadome_detector_matches_paypal_interstitial(self):
+        self.assertTrue(
+            paypal_nocard._looks_like_paypal_datadome(
+                '<html><script src="https://geo.ddc.paypal.com/interstitial/"></script></html>'
+            )
+        )
+        self.assertTrue(paypal_nocard._looks_like_paypal_datadome("captcha-delivery.com ddcaptcha"))
+        self.assertFalse(paypal_nocard._looks_like_paypal_datadome('{"data":{"ok":true}}'))
+
+    def test_proxy_candidates_prefers_nocard_then_paypal_pool(self):
+        cfg = {
+            "proxy": {"default": "socks5h://127.0.0.1:7897", "pool": ["socks5h://127.0.0.1:7898"]},
+            "paypal": {"proxies": ["socks5h://127.0.0.1:7899"]},
+            "paypal_nocard": {"proxies": ["socks5h://127.0.0.1:7900", "socks5h://127.0.0.1:7899"]},
+        }
+        self.assertEqual(
+            paypal_nocard._proxy_candidates(cfg, "socks5h://127.0.0.1:7897"),
+            [
+                "socks5h://127.0.0.1:7897",
+                "socks5h://127.0.0.1:7900",
+                "socks5h://127.0.0.1:7899",
+                "socks5h://127.0.0.1:7898",
+            ],
+        )
+
     def test_round_robin_pools_are_persisted(self):
         cfg = {
             "paypal_auto": {
                 "cards": [
                     {"number": "4111111111111111", "exp_month": "01", "exp_year": "2030", "cvv": "123"},
                     {"number": "5555555555554444", "exp_month": "02", "exp_year": "2031", "cvv": "456"},
+                ],
+                "addresses": [
+                    {"line1": "1 Main St", "city": "New York", "state": "New York", "postal_code": "10001"},
+                    {"line1": "2 Main St", "city": "Los Angeles", "state": "CA", "postal_code": "90001"},
                 ],
             },
             "paypal_nocard": {
@@ -105,6 +150,31 @@ class PayPalNoCardUnitTests(unittest.TestCase):
 
                 self.assertEqual((Path(tmp) / "runtime" / "card_idx.txt").read_text().strip(), "0")
                 self.assertEqual((Path(tmp) / "runtime" / "phone_idx.txt").read_text().strip(), "0")
+
+    def test_card_and_address_use_same_round_robin_index(self):
+        cfg = {
+            "paypal_auto": {
+                "cards": [
+                    {"number": "4111111111111111", "exp_month": "01", "exp_year": "2030", "cvv": "123"},
+                    {"number": "5555555555554444", "exp_month": "02", "exp_year": "2031", "cvv": "456"},
+                ],
+                "addresses": [
+                    {"line1": "1 Main St", "city": "New York", "state": "New York", "postal_code": "10001"},
+                    {"line1": "2 Main St", "city": "Los Angeles", "state": "CA", "postal_code": "90001"},
+                ],
+            },
+            "paypal_nocard": {"card_index_file": "runtime/card_idx.txt"},
+        }
+        with tempfile.TemporaryDirectory() as tmp:
+            with patch.object(paypal_nocard, "PROJECT_ROOT", tmp):
+                card1, address1 = paypal_nocard.get_next_card_and_address(cfg)
+                card2, address2 = paypal_nocard.get_next_card_and_address(cfg)
+
+        self.assertEqual(card1["number"], "4111111111111111")
+        self.assertEqual(address1["line1"], "1 Main St")
+        self.assertEqual(address1["state"], "NY")
+        self.assertEqual(card2["number"], "5555555555554444")
+        self.assertEqual(address2["line1"], "2 Main St")
 
     def test_one_click_pay_regenerates_fresh_url_by_default(self):
         card = {"number": "4111111111111111", "exp_month": "01", "exp_year": "2030", "cvv": "123"}
@@ -314,9 +384,10 @@ class PayPalNoCardUnitTests(unittest.TestCase):
         cfg = {"paypal_nocard": {"enabled": True}}
         card = {"number": "4111111111111111", "exp_month": "01", "exp_year": "2030", "cvv": "123"}
         phone = {"phone": "+14482162932", "sms_api_url": "https://sms.example/code"}
+        address = {"line1": "1 Main St", "city": "New York", "state": "NY", "postal_code": "10001"}
 
         with patch.object(paypal_nocard, "_load_config", return_value=cfg):
-            with patch.object(paypal_nocard, "get_next_card", return_value=card):
+            with patch.object(paypal_nocard, "get_next_card_and_address", return_value=(card, address)):
                 with patch.object(paypal_nocard, "get_next_phone", return_value=phone):
                     with patch.object(paypal_nocard, "_get_access_token", return_value="at_test"):
                         with patch.object(paypal_nocard, "one_click_pay", return_value={"ok": True}) as pay:
@@ -343,7 +414,153 @@ class PayPalNoCardUnitTests(unittest.TestCase):
         )
         self.assertEqual(pay.call_args.kwargs["paypal_status"], "link_ready")
         self.assertEqual(pay.call_args.kwargs["paypal_updated_at"], 123456)
+        self.assertEqual(pay.call_args.kwargs["address"], address)
         mark.assert_called_once_with("paid@example.com", "completed")
+
+    def test_one_click_pay_retries_next_proxy_after_datadome(self):
+        card = {"number": "4111111111111111", "exp_month": "01", "exp_year": "2030", "cvv": "123"}
+        phone = {"phone": "+14482162932", "sms_api_url": "https://sms.example/code"}
+        signup_result = paypal_nocard.SignupResult(
+            success=True,
+            return_url="https://www.paypal.com/checkoutnow/return",
+            ba_token="BA-TEST123456789",
+            user_id="user_123",
+            ec_token="EC-1ABCD234EFGH56789",
+        )
+
+        def fake_signup(*args, **kwargs):
+            if kwargs.get("proxy") == "socks5h://127.0.0.1:7897":
+                raise paypal_nocard.PayPalDataDomeBlocked("PayPal DataDome 拦截")
+            return signup_result
+
+        with patch.object(paypal_nocard, "signup_no_card", side_effect=fake_signup) as signup:
+            with patch("builtins.print"):
+                result = paypal_nocard.one_click_pay(
+                    "at_test",
+                    card=card,
+                    phone=phone,
+                    proxy="socks5h://127.0.0.1:7897",
+                    cfg={
+                        "paypal": {"proxies": ["socks5h://127.0.0.1:7898"]},
+                        "paypal_nocard": {"locale_country": "US", "locale_lang": "en", "otp_timeout": 30},
+                    },
+                    paypal_url="https://www.paypal.com/agreements/approve?ba_token=BA-TEST123456789",
+                    paypal_status="link_ready",
+                    paypal_updated_at=int(time.time()),
+                )
+
+        self.assertTrue(result["ok"])
+        self.assertEqual([call.kwargs["proxy"] for call in signup.call_args_list], [
+            "socks5h://127.0.0.1:7897",
+            "socks5h://127.0.0.1:7898",
+        ])
+
+    def test_one_click_pay_passes_datadome_browser_seed_options(self):
+        card = {"number": "4111111111111111", "exp_month": "01", "exp_year": "2030", "cvv": "123"}
+        phone = {"phone": "+14482162932", "sms_api_url": "https://sms.example/code"}
+        signup_result = paypal_nocard.SignupResult(
+            success=True,
+            return_url="https://www.paypal.com/checkoutnow/return",
+            ba_token="BA-TEST123456789",
+            user_id="user_123",
+            ec_token="EC-1ABCD234EFGH56789",
+        )
+
+        with patch.object(paypal_nocard, "signup_no_card", return_value=signup_result) as signup:
+            with patch("builtins.print"):
+                result = paypal_nocard.one_click_pay(
+                    "at_test",
+                    card=card,
+                    phone=phone,
+                    proxy="socks5h://127.0.0.1:7897",
+                    cfg={
+                        "paypal_nocard": {
+                            "locale_country": "US",
+                            "locale_lang": "en",
+                            "otp_timeout": 30,
+                            "datadome_browser_seed": True,
+                            "datadome_browser_timeout": 456,
+                            "datadome_browser_headless": True,
+                            "datadome_seed_engine": "camoufox",
+                        },
+                    },
+                    paypal_url="https://www.paypal.com/agreements/approve?ba_token=BA-TEST123456789",
+                    paypal_status="link_ready",
+                    paypal_updated_at=int(time.time()),
+                )
+
+        self.assertTrue(result["ok"])
+        self.assertTrue(signup.call_args.kwargs["datadome_browser_seed"])
+        self.assertEqual(signup.call_args.kwargs["datadome_browser_timeout"], 456)
+        self.assertTrue(signup.call_args.kwargs["datadome_browser_headless"])
+        self.assertEqual(signup.call_args.kwargs["datadome_seed_engine"], "camoufox")
+
+    def test_browser_seed_paypal_datadome_reads_isolated_process_result(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            original_project_root = paypal_nocard.PROJECT_ROOT
+            paypal_nocard.PROJECT_ROOT = tmp
+            try:
+                def fake_run(cmd, **kwargs):
+                    out_path = Path(cmd[cmd.index("--out") + 1])
+                    out_path.write_text(
+                        json.dumps(
+                            {
+                                "ok": True,
+                                "engine": "chromium",
+                                "ec_token": "EC-1ABCD234EFGH56789",
+                                "signup_url": "https://www.paypal.com/checkoutweb/signup?token=EC-1ABCD234EFGH56789",
+                                "cookies": {"ts": "abc"},
+                            }
+                        ),
+                        encoding="utf-8",
+                    )
+                    return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+
+                with patch.object(paypal_nocard.subprocess, "run", side_effect=fake_run) as run:
+                    result = paypal_nocard._browser_seed_paypal_datadome(
+                        "BA-TEST123456789",
+                        proxy="socks5h://127.0.0.1:7897",
+                        locale_country="US",
+                        locale_lang="en",
+                        timeout=60,
+                        headless=True,
+                        engine="chromium",
+                    )
+            finally:
+                paypal_nocard.PROJECT_ROOT = original_project_root
+
+        self.assertEqual(result["ec_token"], "EC-1ABCD234EFGH56789")
+        self.assertEqual(result["cookies"], {"ts": "abc"})
+        cmd = run.call_args.args[0]
+        self.assertIn("sms_tool.paypal_datadome_seed", cmd)
+        self.assertIn("--headless", cmd)
+        self.assertEqual(cmd[cmd.index("--engine") + 1], "chromium")
+
+    def test_browser_seed_paypal_datadome_raises_on_isolated_process_failure(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            original_project_root = paypal_nocard.PROJECT_ROOT
+            paypal_nocard.PROJECT_ROOT = tmp
+            try:
+                def fake_run(cmd, **kwargs):
+                    out_path = Path(cmd[cmd.index("--out") + 1])
+                    out_path.write_text(
+                        json.dumps({"ok": False, "engine": "chromium", "error": "driver crashed"}),
+                        encoding="utf-8",
+                    )
+                    return subprocess.CompletedProcess(cmd, 1, stdout="", stderr="boom")
+
+                with patch.object(paypal_nocard.subprocess, "run", side_effect=fake_run):
+                    with self.assertRaises(paypal_nocard.PayPalDataDomeBlocked) as ctx:
+                        paypal_nocard._browser_seed_paypal_datadome(
+                            "BA-TEST123456789",
+                            timeout=60,
+                            engine="chromium",
+                        )
+            finally:
+                paypal_nocard.PROJECT_ROOT = original_project_root
+
+        self.assertIn("seed", str(ctx.exception))
+        self.assertIn("driver crashed", str(ctx.exception))
 
     def test_regenerate_paypal_link_stores_resolved_ba_url(self):
         original_url = "https://pm-redirects.stripe.com/authorize/sa_nonce_test"

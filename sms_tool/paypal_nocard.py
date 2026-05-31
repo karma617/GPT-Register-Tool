@@ -23,6 +23,8 @@ import os
 import random
 import re
 import string
+import subprocess
+import sys
 import time
 import urllib.parse
 from dataclasses import asdict, dataclass, field
@@ -53,6 +55,12 @@ PROJECT_ROOT = os.path.dirname(SCRIPT_DIR)
 DEFAULT_CONFIG_PATH = os.path.join(PROJECT_ROOT, "config.json")
 
 # ── 数据类型 ──────────────────────────────────────────────────────────────────
+
+
+class PayPalDataDomeBlocked(RuntimeError):
+    """PayPal DataDome interstitial means this proxy/session cannot continue via pure HTTP."""
+
+    error_code = "PAYPAL_DATADOME_BLOCKED"
 
 
 @dataclass
@@ -121,6 +129,66 @@ def _us_state_code(value: str) -> str:
     return US_STATE_ABBR.get(v.upper(), v)
 
 
+def _looks_like_paypal_datadome(text: str) -> bool:
+    """Detect PayPal DataDome interstitial/challenge HTML."""
+    head = (text or "")[:5000].lower()
+    return any(
+        marker in head
+        for marker in (
+            "datadome",
+            "geo.ddc.paypal.com",
+            "ct.ddc.paypal.com",
+            "ddcaptcha",
+            "ddchallenge",
+            "captcha-delivery.com",
+        )
+    )
+
+
+def _raise_if_paypal_datadome(text: str, stage: str) -> None:
+    if _looks_like_paypal_datadome(text):
+        raise PayPalDataDomeBlocked(f"PayPal DataDome 拦截: {stage} (需要干净代理/换 IP 或浏览器接管)")
+
+
+def _proxy_candidates(cfg: dict[str, Any], current_proxy: Optional[str]) -> list[Optional[str]]:
+    """Return ordered PayPal proxy candidates for retry."""
+    values: list[Optional[str]] = []
+
+    def add(value: Any, *, allow_none: bool = False) -> None:
+        if value is None:
+            if allow_none:
+                values.append(None)
+            return
+        if isinstance(value, str):
+            stripped = value.strip()
+            if stripped:
+                values.append(stripped)
+
+    add(current_proxy, allow_none=True)
+    paypal_cfg = cfg.get("paypal") if isinstance(cfg.get("paypal"), dict) else {}
+    nocard_cfg = cfg.get("paypal_nocard") if isinstance(cfg.get("paypal_nocard"), dict) else {}
+    proxy_cfg = cfg.get("proxy") if isinstance(cfg.get("proxy"), dict) else {}
+
+    for item in nocard_cfg.get("proxies") or []:
+        add(item)
+    for item in paypal_cfg.get("proxies") or []:
+        add(item)
+    add((paypal_cfg.get("stage_proxies") or {}).get("checkout"))
+    add(proxy_cfg.get("default"))
+    for item in proxy_cfg.get("pool") or []:
+        add(item)
+
+    out: list[Optional[str]] = []
+    seen: set[str] = set()
+    for item in values:
+        key = item or ""
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(item)
+    return out or [current_proxy]
+
+
 def _phone_split(e164: str) -> tuple[str, str]:
     raw = (e164 or "").strip()
     s = re.sub(r"\D", "", raw)
@@ -166,10 +234,12 @@ def _card_type(number: str) -> str:
 
 def _load_config() -> dict[str, Any]:
     try:
-        with open(DEFAULT_CONFIG_PATH, "r", encoding="utf-8") as f:
+        with open(DEFAULT_CONFIG_PATH, "r", encoding="utf-8-sig") as f:
             return json.load(f)
-    except Exception:
-        return {}
+    except FileNotFoundError as exc:
+        raise RuntimeError(f"config.json not found: {DEFAULT_CONFIG_PATH}") from exc
+    except Exception as exc:
+        raise RuntimeError(f"failed to load config.json: {exc}") from exc
 
 
 def _next_from_pool(index_file: str, pool: list) -> int:
@@ -202,7 +272,34 @@ def get_next_card(cfg: dict[str, Any]) -> dict[str, str]:
     idx_file = ((cfg.get("paypal_nocard") or {}).get("card_index_file")
                 or "runtime/nocard_card_index.txt")
     idx = _next_from_pool(idx_file, cards)
-    return cards[idx]
+    return cards[idx % len(cards)]
+
+
+def _normalize_address(addr: dict[str, Any]) -> dict[str, str]:
+    state = str(addr.get("state") or "").strip()
+    if len(state) > 2:
+        state = _us_state_code(state)
+    return {
+        "line1": str(addr.get("line1") or addr.get("street") or "123 Main St").strip(),
+        "city": str(addr.get("city") or "New York").strip(),
+        "state": state or "NY",
+        "postal_code": str(addr.get("postal_code") or addr.get("zip") or "10001").strip(),
+        "country": str(addr.get("country") or "US").strip().upper() or "US",
+    }
+
+
+def get_next_card_and_address(cfg: dict[str, Any]) -> tuple[dict[str, str], dict[str, str]]:
+    """从同一个轮询索引取下一张卡和对应账单地址。"""
+    cards = (cfg.get("paypal_auto") or {}).get("cards") or []
+    if not cards:
+        raise RuntimeError("config.json 中 paypal_auto.cards 为空")
+    addresses = (cfg.get("paypal_auto") or {}).get("addresses") or []
+    idx_file = ((cfg.get("paypal_nocard") or {}).get("card_index_file")
+                or "runtime/nocard_card_index.txt")
+    idx = _next_from_pool(idx_file, cards)
+    card = cards[idx % len(cards)]
+    address = _normalize_address(addresses[idx % len(addresses)] if addresses else _default_address())
+    return card, address
 
 
 def get_next_phone(cfg: dict[str, Any]) -> dict[str, str]:
@@ -213,7 +310,7 @@ def get_next_phone(cfg: dict[str, Any]) -> dict[str, str]:
     idx_file = ((cfg.get("paypal_nocard") or {}).get("phone_index_file")
                 or "runtime/nocard_phone_index.txt")
     idx = _next_from_pool(idx_file, pool)
-    return pool[idx]
+    return pool[idx % len(pool)]
 
 
 # ── HTTP Session ──────────────────────────────────────────────────────────────
@@ -256,6 +353,19 @@ def _session_cookies(s: Any) -> dict[str, str]:
             return {c.name: c.value for c in s.cookies}
         except Exception:
             return {}
+
+
+def _merge_cookies(s: Any, cookies: dict[str, str]) -> None:
+    for name, value in (cookies or {}).items():
+        if not name or value is None:
+            continue
+        try:
+            s.cookies.set(name, value, domain=".paypal.com", path="/")
+        except Exception:
+            try:
+                s.cookies[name] = value
+            except Exception:
+                pass
 
 
 # ── BA Token 提取 ─────────────────────────────────────────────────────────────
@@ -647,11 +757,13 @@ def _gql(
     }
     r = s.post(f"{PP_ORIGIN}/graphql", json=body, headers=headers, timeout=timeout)
     if r.status_code != 200:
+        _raise_if_paypal_datadome(r.text or "", f"graphql {op_name} HTTP {r.status_code}")
         raise RuntimeError(f"graphql {op_name} HTTP {r.status_code}: {r.text[:300]}")
     try:
         data = r.json()
     except Exception:
         text = r.text or ""
+        _raise_if_paypal_datadome(text, f"graphql {op_name}")
         if "authchallenge" in text[:1200].lower() or "captcha" in text[:1200].lower():
             raise RuntimeError(f"graphql {op_name}: PayPal returned captcha/challenge page")
         raise RuntimeError(f"graphql {op_name} JSON parse failed: {text[:200]}")
@@ -833,9 +945,8 @@ def _bootstrap(
 
     r1 = s.get(url, headers=headers, timeout=timeout, allow_redirects=True)
     html1 = r1.text or ""
+    _raise_if_paypal_datadome(html1, "agreements_approve")
     if r1.status_code != 200:
-        if "datadome" in html1[:1500].lower() or "geo.ddc.paypal.com" in html1[:3000].lower():
-            raise RuntimeError("PayPal DataDome 拦截 (需要代理或换 IP)")
         raise RuntimeError(f"/agreements/approve 失败: {r1.status_code}")
 
     ec_token = extract_ec_token(html1)
@@ -878,6 +989,7 @@ def _bootstrap(
             allow_redirects=False,
         )
         signup_html = r3.text or ""
+        _raise_if_paypal_datadome(signup_html, "checkoutweb_signup")
         m_ec2 = extract_ec_token(signup_url) or extract_ec_token(signup_html)
         if m_ec2:
             ec_token = m_ec2
@@ -886,6 +998,102 @@ def _bootstrap(
 
     return ec_token, signup_url, signup_html
 
+
+def _browser_seed_paypal_datadome(
+    ba_token: str,
+    *,
+    proxy: Optional[str] = None,
+    locale_country: str = "US",
+    locale_lang: str = "en",
+    timeout: int = 300,
+    headless: bool = False,
+    engine: str = "chromium",
+) -> dict[str, Any]:
+    """Use an isolated browser seed subprocess to harvest PayPal cookies/EC token."""
+    safe_engine = (engine or "chromium").strip().lower()
+    if safe_engine not in {"chromium", "camoufox"}:
+        safe_engine = "chromium"
+
+    try:
+        timeout_i = int(timeout or 300)
+    except Exception:
+        timeout_i = 300
+    timeout_i = max(30, timeout_i)
+
+    runtime_dir = Path(PROJECT_ROOT) / "runtime"
+    runtime_dir.mkdir(parents=True, exist_ok=True)
+    out_path = runtime_dir / f"paypal_datadome_seed_{os.getpid()}_{int(time.time() * 1000)}.json"
+    cmd = [
+        sys.executable,
+        "-m",
+        "sms_tool.paypal_datadome_seed",
+        "--ba-token",
+        ba_token,
+        "--out",
+        str(out_path),
+        "--locale-country",
+        locale_country,
+        "--locale-lang",
+        locale_lang,
+        "--timeout",
+        str(timeout_i),
+        "--engine",
+        safe_engine,
+    ]
+    if proxy:
+        cmd.extend(["--proxy", proxy])
+    if headless:
+        cmd.append("--headless")
+
+    print(
+        "[one-click-pay] PayPal DataDome \u6d4f\u89c8\u5668 seed \u5b50\u8fdb\u7a0b\u542f\u52a8: "
+        f"engine={safe_engine} timeout={timeout_i}s",
+        flush=True,
+    )
+    try:
+        proc = subprocess.run(
+            cmd,
+            cwd=PROJECT_ROOT,
+            text=True,
+            capture_output=True,
+            timeout=timeout_i + 90,
+        )
+    except subprocess.TimeoutExpired as exc:
+        raise PayPalDataDomeBlocked(
+            "[one-click-pay] PayPal DataDome \u6d4f\u89c8\u5668 seed \u5b50\u8fdb\u7a0b\u8d85\u65f6: "
+            f"engine={safe_engine} timeout={timeout_i}s"
+        ) from exc
+
+    payload: dict[str, Any] = {}
+    if out_path.exists():
+        try:
+            payload = json.loads(out_path.read_text(encoding="utf-8-sig"))
+        except Exception as exc:
+            raise PayPalDataDomeBlocked(f"PayPal DataDome seed \u7ed3\u679c\u89e3\u6790\u5931\u8d25: {exc}") from exc
+
+    if proc.returncode != 0 or not payload.get("ok"):
+        stderr = (proc.stderr or "").strip()
+        stdout = (proc.stdout or "").strip()
+        error = str(payload.get("error") or stderr or stdout or f"exit={proc.returncode}")[:500]
+        raise PayPalDataDomeBlocked(
+            f"PayPal DataDome seed \u5b50\u8fdb\u7a0b\u5931\u8d25: engine={safe_engine} error={error}"
+        )
+
+    ec_token = str(payload.get("ec_token") or "")
+    if not ec_token:
+        raise PayPalDataDomeBlocked(f"PayPal DataDome seed \u672a\u83b7\u5f97 EC token: engine={safe_engine}")
+
+    return {
+        "ec_token": ec_token,
+        "signup_url": str(payload.get("signup_url") or "") or _build_signup_url(
+            ba_token=ba_token,
+            ec_token=ec_token,
+            locale_country=locale_country,
+            locale_lang=locale_lang,
+        ),
+        "signup_html": str(payload.get("signup_html") or ""),
+        "cookies": payload.get("cookies") if isinstance(payload.get("cookies"), dict) else {},
+    }
 
 # ── 签名变量构建 ──────────────────────────────────────────────────────────────
 
@@ -969,6 +1177,10 @@ def signup_no_card(
     locale_lang: str = "en",
     otp_timeout: int = 180,
     request_timeout: int = 30,
+    datadome_browser_seed: bool = False,
+    datadome_browser_timeout: int = 300,
+    datadome_browser_headless: bool = False,
+    datadome_seed_engine: str = "chromium",
 ) -> SignupResult:
     """执行 PayPal 无卡协议签约。
 
@@ -1004,12 +1216,34 @@ def signup_no_card(
     logger.info("signup persona=%s %s <%s>", persona.first_name, persona.last_name, persona.email)
 
     # 1) Bootstrap → EC token + cookies + signup URL
-    ec_token, signup_url, signup_html = _bootstrap(
-        s, ba_token,
-        locale_country=locale_country,
-        locale_lang=locale_lang,
-        timeout=request_timeout,
-    )
+    try:
+        ec_token, signup_url, signup_html = _bootstrap(
+            s, ba_token,
+            locale_country=locale_country,
+            locale_lang=locale_lang,
+            timeout=request_timeout,
+        )
+    except PayPalDataDomeBlocked:
+        if not datadome_browser_seed:
+            raise
+        print(
+            "[one-click-pay] \u534f\u8bae bootstrap \u547d\u4e2d DataDome\uff0c"
+            f"\u5207\u6362\u9694\u79bb\u6d4f\u89c8\u5668 seed: engine={datadome_seed_engine}",
+            flush=True,
+        )
+        seed = _browser_seed_paypal_datadome(
+            ba_token,
+            proxy=proxy,
+            locale_country=locale_country,
+            locale_lang=locale_lang,
+            timeout=datadome_browser_timeout,
+            headless=datadome_browser_headless,
+            engine=datadome_seed_engine,
+        )
+        _merge_cookies(s, seed.get("cookies") or {})
+        ec_token = str(seed.get("ec_token") or "")
+        signup_url = str(seed.get("signup_url") or "")
+        signup_html = str(seed.get("signup_html") or "")
     logger.info("ec_token=%s signup_url=%s", ec_token, signup_url[:120])
 
     # 2) GraphQL warmup: DeferredFeature
@@ -1231,6 +1465,7 @@ def one_click_pay(
     *,
     card: dict[str, str],
     phone: dict[str, str],
+    address: Optional[dict[str, str]] = None,
     proxy: Optional[str] = None,
     cfg: Optional[dict[str, Any]] = None,
     paypal_url: Optional[str] = None,
@@ -1259,6 +1494,15 @@ def one_click_pay(
     locale_country = nocard_cfg.get("locale_country") or "US"
     locale_lang = nocard_cfg.get("locale_lang") or "en"
     otp_timeout = int(nocard_cfg.get("otp_timeout") or 180)
+    datadome_browser_seed = bool(nocard_cfg.get("datadome_browser_seed", False))
+    datadome_browser_headless = bool(nocard_cfg.get("datadome_browser_headless", False))
+    datadome_seed_engine = str(nocard_cfg.get("datadome_seed_engine") or "chromium").strip().lower()
+    if datadome_seed_engine not in {"chromium", "camoufox"}:
+        datadome_seed_engine = "chromium"
+    try:
+        datadome_browser_timeout = int(nocard_cfg.get("datadome_browser_timeout", 300) or 300)
+    except Exception:
+        datadome_browser_timeout = 300
     reuse_saved_url = bool(nocard_cfg.get("reuse_saved_url", False))
     reuse_saved_ready_url = bool(nocard_cfg.get("reuse_saved_ready_url", True))
     try:
@@ -1369,27 +1613,64 @@ def one_click_pay(
     phone_display = phone_e164[-4:].rjust(len(phone_e164), "*")
     print(f"[one-click-pay] 执行 PayPal 无卡签约: card={card_display} phone=****{phone_display}", flush=True)
 
-    try:
-        result = signup_no_card(
-            ba_token,
-            phone_e164=phone_e164,
-            sms_api_url=sms_api_url,
-            card=card,
-            address=_default_address(),
-            proxy=proxy,
-            locale_country=locale_country,
-            locale_lang=locale_lang,
-            otp_timeout=otp_timeout,
-        )
-    except Exception as exc:
-        error = str(exc) or type(exc).__name__
-        error_l = error.lower()
-        error_code = "PAYPAL_DATADOME_BLOCKED" if "datadome" in error_l else "signup_exception"
-        print(f"[one-click-pay] 签约异常: {error}", flush=True)
+    result: Optional[SignupResult] = None
+    datadome_errors: list[str] = []
+    proxies = _proxy_candidates(cfg, proxy)
+    for attempt, attempt_proxy in enumerate(proxies, 1):
+        if attempt > 1:
+            print(f"[one-click-pay] DataDome 后切换代理重试 {attempt}/{len(proxies)}: {attempt_proxy or 'DIRECT'}", flush=True)
+        try:
+            result = signup_no_card(
+                ba_token,
+                phone_e164=phone_e164,
+                sms_api_url=sms_api_url,
+                card=card,
+                address=_normalize_address(address or _default_address()),
+                proxy=attempt_proxy,
+                locale_country=locale_country,
+                locale_lang=locale_lang,
+                otp_timeout=otp_timeout,
+                datadome_browser_seed=datadome_browser_seed,
+                datadome_browser_timeout=datadome_browser_timeout,
+                datadome_browser_headless=datadome_browser_headless,
+                datadome_seed_engine=datadome_seed_engine,
+            )
+            break
+        except PayPalDataDomeBlocked as exc:
+            error = str(exc) or type(exc).__name__
+            datadome_errors.append(f"{attempt_proxy or 'DIRECT'}: {error}")
+            print(f"[one-click-pay] PayPal DataDome 拦截: proxy={attempt_proxy or 'DIRECT'}", flush=True)
+            if attempt < len(proxies):
+                continue
+            return {
+                "ok": False,
+                "error": (
+                    "PayPal DataDome 拦截，已尝试所有代理；请在 config.json 的 paypal_nocard.proxies "
+                    "或 paypal.proxies 增加干净出口，或设置 paypal_nocard.datadome_browser_seed=true 后人工完成浏览器验证"
+                ),
+                "error_code": PayPalDataDomeBlocked.error_code,
+                "paypal_url": paypal_url,
+                "ba_token": ba_token,
+                "debug": {"datadome_attempts": datadome_errors},
+            }
+        except Exception as exc:
+            error = str(exc) or type(exc).__name__
+            error_l = error.lower()
+            error_code = "PAYPAL_DATADOME_BLOCKED" if "datadome" in error_l else "signup_exception"
+            print(f"[one-click-pay] 签约异常: {error}", flush=True)
+            return {
+                "ok": False,
+                "error": error,
+                "error_code": error_code,
+                "paypal_url": paypal_url,
+                "ba_token": ba_token,
+            }
+
+    if result is None:
         return {
             "ok": False,
-            "error": error,
-            "error_code": error_code,
+            "error": "PayPal 签约未执行",
+            "error_code": "signup_not_started",
             "paypal_url": paypal_url,
             "ba_token": ba_token,
         }
@@ -1469,7 +1750,7 @@ def one_click_pay_batch(args) -> None:
         print(f"\n[one-click-pay] === {i}/{len(emails)}: {email} ===", flush=True)
 
         # 从轮询池取资源
-        card = get_next_card(cfg)
+        card, address = get_next_card_and_address(cfg)
         phone = get_next_phone(cfg)
 
         # 获取 access_token (从 session JSON 或 SQLite)
@@ -1488,6 +1769,7 @@ def one_click_pay_batch(args) -> None:
             access_token,
             card=card,
             phone=phone,
+            address=address,
             proxy=proxy,
             cfg=cfg,
             paypal_url=existing_url or None,

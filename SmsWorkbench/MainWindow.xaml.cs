@@ -2818,6 +2818,8 @@ namespace SmsWorkbench
             var email = GetSection(config, "email_registration");
             var proxy = GetSection(config, "proxy");
             var paypal = GetSection(config, "paypal");
+            var paypalAuto = GetSection(config, "paypal_auto");
+            var paypalNoCard = GetSection(config, "paypal_nocard");
             var gopay = GetSection(config, "gopay");
             var gopayStageProxies = GetChildSection(gopay, "stage_proxies");
             var gopayWaRebind = GetChildSection(gopay, "wa_rebind");
@@ -2953,10 +2955,29 @@ namespace SmsWorkbench
             AddConfigField(sub2Form, fields, row++, "SUB2API优先级", "sub2api_priority", GetString(sub2api, "priority"));
             AddConfigField(sub2Form, fields, row++, "SUB2API并发", "sub2api_concurrency", GetString(sub2api, "concurrency"));
 
-            var proxyForm = AddConfigCategory(sidebar, host, categories, "代理 / 支付", "默认代理和 PayPal 链接生成代理。");
+            var proxyForm = AddConfigCategory(sidebar, host, categories, "代理 / 支付", "默认代理、PayPal 链接生成代理和 no-card 支付参数。");
             row = 0;
             AddConfigField(proxyForm, fields, row++, "默认代理", "default_proxy", GetString(proxy, "default"));
             AddConfigField(proxyForm, fields, row++, "PayPal代理", "paypal_proxy", FirstListValue(paypal, "proxies"));
+            AddConfigField(proxyForm, fields, row++, "PayPal代理池", "paypal_proxies", ListToLines(paypal, "proxies"));
+            AddConfigField(proxyForm, fields, row++, "NoCard启用", "paypal_nocard_enabled", FirstNonEmpty(GetString(paypalNoCard, "enabled"), "false"));
+            AddConfigField(proxyForm, fields, row++, "NoCard地区", "paypal_nocard_locale_country", FirstNonEmpty(GetString(paypalNoCard, "locale_country"), "US"));
+            AddConfigField(proxyForm, fields, row++, "NoCard语言", "paypal_nocard_locale_lang", FirstNonEmpty(GetString(paypalNoCard, "locale_lang"), "en"));
+            AddConfigField(proxyForm, fields, row++, "OTP超时秒", "paypal_nocard_otp_timeout", FirstNonEmpty(GetString(paypalNoCard, "otp_timeout"), "180"));
+            AddConfigField(proxyForm, fields, row++, "TLS指纹", "paypal_nocard_impersonate", FirstNonEmpty(GetString(paypalNoCard, "impersonate"), "chrome136"));
+            AddConfigField(proxyForm, fields, row++, "DataDome浏览器接管", "paypal_nocard_datadome_browser_seed", FirstNonEmpty(GetString(paypalNoCard, "datadome_browser_seed"), "false"));
+            AddConfigField(proxyForm, fields, row++, "接管超时秒", "paypal_nocard_datadome_browser_timeout", FirstNonEmpty(GetString(paypalNoCard, "datadome_browser_timeout"), "300"));
+            AddConfigField(proxyForm, fields, row++, "接管Headless", "paypal_nocard_datadome_browser_headless", FirstNonEmpty(GetString(paypalNoCard, "datadome_browser_headless"), "false"));
+            AddConfigField(proxyForm, fields, row++, "NoCard代理池", "paypal_nocard_proxies", ListToLines(paypalNoCard, "proxies"));
+            AddConfigField(proxyForm, fields, row++, "复用保存链接", "paypal_nocard_reuse_saved_url", FirstNonEmpty(GetString(paypalNoCard, "reuse_saved_url"), "false"));
+            AddConfigField(proxyForm, fields, row++, "复用新鲜链接", "paypal_nocard_reuse_saved_ready_url", FirstNonEmpty(GetString(paypalNoCard, "reuse_saved_ready_url"), "true"));
+            AddConfigField(proxyForm, fields, row++, "链接最大秒", "paypal_nocard_saved_url_max_age_seconds", FirstNonEmpty(GetString(paypalNoCard, "saved_url_max_age_seconds"), "1800"));
+            AddConfigField(proxyForm, fields, row++, "失败回退旧链接", "paypal_nocard_fallback_to_saved_url", FirstNonEmpty(GetString(paypalNoCard, "fallback_to_saved_url"), "false"));
+            AddConfigField(proxyForm, fields, row++, "卡索引文件", "paypal_nocard_card_index_file", FirstNonEmpty(GetString(paypalNoCard, "card_index_file"), "runtime/nocard_card_index.txt"));
+            AddConfigField(proxyForm, fields, row++, "手机索引文件", "paypal_nocard_phone_index_file", FirstNonEmpty(GetString(paypalNoCard, "phone_index_file"), "runtime/nocard_phone_index.txt"));
+            AddConfigField(proxyForm, fields, row++, "卡池JSON", "paypal_auto_cards", JsonFieldValue(paypalAuto, "cards"));
+            AddConfigField(proxyForm, fields, row++, "地址池JSON", "paypal_auto_addresses", JsonFieldValue(paypalAuto, "addresses"));
+            AddConfigField(proxyForm, fields, row++, "手机池JSON", "paypal_nocard_phone_pool", JsonFieldValue(paypalNoCard, "phone_pool"));
 
             var gopayForm = AddConfigCategory(sidebar, host, categories, "GoPay", "GoPay 生链、协议支付服务和分阶段代理配置。");
             row = 0;
@@ -3047,7 +3068,31 @@ namespace SmsWorkbench
                 codexOauth["require_registration_refresh_token"] = ConfigBoolValue(fields, "codex_require_registration_refresh_token", GetBool(codexOauth, "require_registration_refresh_token", true));
                 codexOauth["require_registration_phone_verification"] = ConfigBoolValue(fields, "codex_require_registration_phone_verification", GetBool(codexOauth, "require_registration_phone_verification", true));
                 proxy["default"] = fields["default_proxy"].Text.Trim();
-                paypal["proxies"] = new List<object> { fields["paypal_proxy"].Text.Trim() };
+                List<object> paypalProxies = LinesToList(fields["paypal_proxies"].Text);
+                string primaryPaypalProxy = fields["paypal_proxy"].Text.Trim();
+                if (primaryPaypalProxy.Length > 0)
+                {
+                    paypalProxies = MergePrimaryListValue(primaryPaypalProxy, paypalProxies);
+                }
+                paypal["proxies"] = paypalProxies;
+                paypalNoCard["enabled"] = ConfigBoolValue(fields, "paypal_nocard_enabled", GetBool(paypalNoCard, "enabled", false));
+                paypalNoCard["locale_country"] = fields["paypal_nocard_locale_country"].Text.Trim();
+                paypalNoCard["locale_lang"] = fields["paypal_nocard_locale_lang"].Text.Trim();
+                paypalNoCard["otp_timeout"] = ConfigIntegerValue(fields, "paypal_nocard_otp_timeout");
+                paypalNoCard["impersonate"] = fields["paypal_nocard_impersonate"].Text.Trim();
+                paypalNoCard["datadome_browser_seed"] = ConfigBoolValue(fields, "paypal_nocard_datadome_browser_seed", GetBool(paypalNoCard, "datadome_browser_seed", false));
+                paypalNoCard["datadome_browser_timeout"] = ConfigIntegerValue(fields, "paypal_nocard_datadome_browser_timeout");
+                paypalNoCard["datadome_browser_headless"] = ConfigBoolValue(fields, "paypal_nocard_datadome_browser_headless", GetBool(paypalNoCard, "datadome_browser_headless", false));
+                paypalNoCard["proxies"] = LinesToList(fields["paypal_nocard_proxies"].Text);
+                paypalNoCard["reuse_saved_url"] = ConfigBoolValue(fields, "paypal_nocard_reuse_saved_url", GetBool(paypalNoCard, "reuse_saved_url", false));
+                paypalNoCard["reuse_saved_ready_url"] = ConfigBoolValue(fields, "paypal_nocard_reuse_saved_ready_url", GetBool(paypalNoCard, "reuse_saved_ready_url", true));
+                paypalNoCard["saved_url_max_age_seconds"] = ConfigIntegerValue(fields, "paypal_nocard_saved_url_max_age_seconds");
+                paypalNoCard["fallback_to_saved_url"] = ConfigBoolValue(fields, "paypal_nocard_fallback_to_saved_url", GetBool(paypalNoCard, "fallback_to_saved_url", false));
+                paypalNoCard["card_index_file"] = fields["paypal_nocard_card_index_file"].Text.Trim();
+                paypalNoCard["phone_index_file"] = fields["paypal_nocard_phone_index_file"].Text.Trim();
+                paypalAuto["cards"] = JsonArrayValue(fields, "paypal_auto_cards", paypalAuto, "cards");
+                paypalAuto["addresses"] = JsonArrayValue(fields, "paypal_auto_addresses", paypalAuto, "addresses");
+                paypalNoCard["phone_pool"] = JsonArrayValue(fields, "paypal_nocard_phone_pool", paypalNoCard, "phone_pool");
                 gopay["one_click_mode"] = fields["gopay_one_click_mode"].Text.Trim();
                 gopay["open_link"] = ConfigBoolValue(fields, "gopay_open_link", GetBool(gopay, "open_link", true));
                 gopay["auto_generate"] = ConfigBoolValue(fields, "gopay_auto_generate", GetBool(gopay, "auto_generate", true));
@@ -3115,6 +3160,8 @@ namespace SmsWorkbench
                 config["email_registration"] = email;
                 config["proxy"] = proxy;
                 config["paypal"] = paypal;
+                config["paypal_auto"] = paypalAuto;
+                config["paypal_nocard"] = paypalNoCard;
                 config["gopay"] = gopay;
                 config["output"] = output;
                 config["storage"] = storage;
@@ -3218,10 +3265,28 @@ namespace SmsWorkbench
                 Text = value ?? "",
                 Margin = new Thickness(0, 0, 0, 10)
             };
+            if (IsMultilineConfigField(key))
+            {
+                box.AcceptsReturn = true;
+                box.AcceptsTab = true;
+                box.TextWrapping = TextWrapping.NoWrap;
+                box.VerticalScrollBarVisibility = ScrollBarVisibility.Auto;
+                box.HorizontalScrollBarVisibility = ScrollBarVisibility.Auto;
+                box.MinHeight = key.EndsWith("_proxies", StringComparison.OrdinalIgnoreCase) ? 88 : 220;
+                box.VerticalContentAlignment = VerticalAlignment.Top;
+            }
             Grid.SetRow(box, row);
             Grid.SetColumn(box, 1);
             form.Children.Add(box);
             fields[key] = box;
+        }
+
+        private bool IsMultilineConfigField(string key)
+        {
+            return key.EndsWith("_proxies", StringComparison.OrdinalIgnoreCase)
+                || key.Equals("paypal_auto_cards", StringComparison.OrdinalIgnoreCase)
+                || key.Equals("paypal_auto_addresses", StringComparison.OrdinalIgnoreCase)
+                || key.Equals("paypal_nocard_phone_pool", StringComparison.OrdinalIgnoreCase);
         }
 
         private Dictionary<string, object> GetSection(Dictionary<string, object> config, string section)
@@ -3291,6 +3356,68 @@ namespace SmsWorkbench
                 return Convert.ToString(list[0]) ?? "";
             }
             return "";
+        }
+
+        private string ListToLines(Dictionary<string, object> data, string key)
+        {
+            if (!data.TryGetValue(key, out object value) || value == null) return "";
+            if (value is List<object> list)
+            {
+                return string.Join(Environment.NewLine, list.Select(item => Convert.ToString(item) ?? "").Where(line => line.Trim().Length > 0));
+            }
+            return Convert.ToString(value) ?? "";
+        }
+
+        private List<object> LinesToList(string text)
+        {
+            var items = new List<object>();
+            foreach (string line in (text ?? "").Split(new[] { "\r\n", "\n", "\r" }, StringSplitOptions.None))
+            {
+                string item = line.Trim();
+                if (item.Length > 0) items.Add(item);
+            }
+            return items;
+        }
+
+        private List<object> MergePrimaryListValue(string primary, List<object> items)
+        {
+            var output = new List<object> { primary };
+            foreach (object item in items)
+            {
+                string value = Convert.ToString(item)?.Trim() ?? "";
+                if (value.Length == 0 || value.Equals(primary, StringComparison.OrdinalIgnoreCase)) continue;
+                output.Add(value);
+            }
+            return output;
+        }
+
+        private string JsonFieldValue(Dictionary<string, object> data, string key)
+        {
+            if (!data.TryGetValue(key, out object value) || value == null) return "[]";
+            var options = new JsonSerializerOptions { WriteIndented = true };
+            return JsonSerializer.Serialize(value, options);
+        }
+
+        private List<object> JsonArrayValue(Dictionary<string, TextBox> fields, string fieldKey, Dictionary<string, object> fallbackData, string fallbackKey)
+        {
+            string raw = fields.TryGetValue(fieldKey, out TextBox box) ? box.Text.Trim() : "";
+            if (raw.Length == 0) return new List<object>();
+            try
+            {
+                using JsonDocument document = JsonDocument.Parse(raw);
+                if (document.RootElement.ValueKind != JsonValueKind.Array) return ExistingArrayValue(fallbackData, fallbackKey);
+                return document.RootElement.EnumerateArray().Select(JsonValueToObject).ToList();
+            }
+            catch
+            {
+                return ExistingArrayValue(fallbackData, fallbackKey);
+            }
+        }
+
+        private List<object> ExistingArrayValue(Dictionary<string, object> data, string key)
+        {
+            if (data.TryGetValue(key, out object value) && value is List<object> list) return list;
+            return new List<object>();
         }
 
         private void SaveConfig(string path, Dictionary<string, object> config)
